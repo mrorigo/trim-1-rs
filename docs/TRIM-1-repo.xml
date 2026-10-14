@@ -1,0 +1,2238 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+The content has been processed where security check has been disabled.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Security check has been disabled - content may contain sensitive information
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+cmd/
+  trim/
+    main.go
+docs/
+  assets/
+    banner.png
+    social-preview.png
+testdata/
+  golden.txt
+  parity.bin
+.gitignore
+bm25.go
+features.go
+go.mod
+LICENSE
+LICENSE-go
+model.bin
+model.go
+README.md
+trim_test.go
+trim.go
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="cmd/trim/main.go">
+// Command trim keeps the lines of a context that a query needs.
+//
+//	trim --query "why does the build fail" build.log
+//	cat build.log | trim --query "why does the build fail" --point balanced
+//
+// The trimmed context goes to stdout and a one-line summary to stderr.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"os"
+
+	trim "github.com/caveman-ai/trim-1"
+)
+
+func main() {
+	query := flag.String("query", "", "the current ask (required)")
+	point := flag.String("point", trim.DefaultPoint, "operating point: conservative, balanced or aggressive")
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: trim --query QUERY [--point POINT] [FILE]   (reads stdin without FILE)")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if *query == "" || flag.NArg() > 1 {
+		flag.Usage()
+		os.Exit(2)
+	}
+	if _, ok := trim.Points[*point]; !ok {
+		fmt.Fprintf(os.Stderr, "trim: unknown point %q\n", *point)
+		os.Exit(2)
+	}
+
+	var (
+		context []byte
+		err     error
+	)
+	if flag.NArg() == 1 {
+		context, err = os.ReadFile(flag.Arg(0))
+	} else {
+		context, err = io.ReadAll(os.Stdin)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "trim:", err)
+		os.Exit(1)
+	}
+
+	res := trim.Compress(string(context), *query, trim.Options{Point: *point})
+	if _, err := os.Stdout.WriteString(res.Output); err != nil {
+		fmt.Fprintln(os.Stderr, "trim:", err)
+		os.Exit(1)
+	}
+	if res.Unchanged {
+		fmt.Fprintf(os.Stderr, "trim: unchanged (%s)\n", res.Reason)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "trim: kept %d lines, removed %d, %d -> %d bytes\n",
+		res.KeptLines, res.RemovedLines, len(context), len(res.Output))
+}
+</file>
+
+<file path="testdata/golden.txt">
+… 269 lines …
+2026-10-11T03:04:28Z INFO checkout request 1268 served in 23ms
+2026-10-11T03:04:29Z INFO checkout request 1269 served in 24ms
+2026-10-11T03:04:30Z INFO checkout request 1270 served in 25ms
+2026-10-11T03:04:31Z INFO checkout request 1271 served in 26ms
+2026-10-11T03:04:31Z ERROR payment client: ledger-db timeout after 30s (order 1271)
+    at LedgerClient.charge (ledger/client.go:88)
+2026-10-11T03:04:32Z INFO checkout request 1272 served in 10ms
+2026-10-11T03:04:33Z INFO checkout request 1273 served in 11ms
+2026-10-11T03:04:34Z INFO checkout request 1274 served in 12ms
+… 126 lines …
+</file>
+
+<file path=".gitignore">
+/trim
+*.test
+</file>
+
+<file path="bm25.go">
+package trim
+
+import (
+	"maps"
+	"math"
+	"slices"
+	"strings"
+	"unicode"
+)
+
+const (
+	bm25K1 = 1.5
+	bm25B  = 0.75
+)
+
+// bm25 scores each doc against the query. The scores are unnormalized and
+// comparable only within the slice. The model was trained on exactly this
+// implementation, so its tokenization, stopwords and term order are fixed.
+func bm25(query string, docs []string) []float64 {
+	queryTerms := bm25TermFreq(query)
+	out := make([]float64, len(docs))
+	if len(queryTerms) == 0 || len(docs) == 0 {
+		return out
+	}
+	tfs := make([]map[string]int, len(docs))
+	docLen := make([]int, len(docs))
+	df := map[string]int{}
+	totalLen := 0
+	for i, doc := range docs {
+		tf := bm25TermFreq(doc)
+		tfs[i] = tf
+		for _, count := range tf {
+			docLen[i] += count
+		}
+		totalLen += docLen[i]
+		for term := range tf {
+			df[term]++
+		}
+	}
+	avgdl := 1.0
+	if totalLen > 0 {
+		avgdl = float64(totalLen) / float64(len(docs))
+	}
+	// A fixed term order: float addition is not associative, and callers break
+	// score ties with exact equality, so map order must not move a score.
+	terms := slices.Sorted(maps.Keys(queryTerms))
+	for i := range docs {
+		for _, term := range terms {
+			tf := float64(tfs[i][term])
+			if tf == 0 {
+				continue
+			}
+			idf := math.Log(1 + (float64(len(docs))-float64(df[term])+0.5)/(float64(df[term])+0.5))
+			denom := tf + bm25K1*(1-bm25B+bm25B*float64(docLen[i])/avgdl)
+			out[i] += idf * (tf * (bm25K1 + 1)) / denom
+		}
+	}
+	return out
+}
+
+func bm25TermFreq(text string) map[string]int {
+	freq := map[string]int{}
+	var current strings.Builder
+	flush := func() {
+		tok := current.String()
+		if len(tok) >= 2 && !bm25Stopwords[tok] {
+			freq[tok]++
+		}
+		current.Reset()
+	}
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			current.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return freq
+}
+
+var bm25Stopwords = map[string]bool{
+	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
+	"be": true, "by": true, "for": true, "from": true, "how": true, "in": true,
+	"is": true, "it": true, "of": true, "on": true, "or": true, "that": true,
+	"the": true, "this": true, "to": true, "was": true, "what": true, "when": true,
+	"where": true, "which": true, "who": true, "why": true, "with": true,
+}
+</file>
+
+<file path="features.go">
+package trim
+
+import (
+	"math"
+	"slices"
+	"sort"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+// FeatureNames lists the per-line features in the order LineFeatures writes
+// them. The embedded model was trained on exactly this order; training and
+// inference both call LineFeatures, so there is one code path.
+var FeatureNames = []string{
+	"bm25", "bm25_norm", "bm25_rank", "bm25_win_sum", "cover_win_sum", "bm25_tail_norm",
+	"cover", "cover_idf", "cover_n", "cover_maxidf", "cover_rank", "cover_tail",
+	"compound_hits", "compound_maxlen", "bigram_hits", "trigram_hits",
+	"idf_mean", "idf_max", "uniq_frac",
+	"k_error", "k_test", "k_path", "k_pathline", "k_heading", "k_diff", "k_section",
+	"k_signature", "k_jsonkey", "k_separator", "k_frame", "k_kv", "k_bullet",
+	"dup", "tmpl", "tmpl_first",
+	"pos_rel", "pos_head", "pos_tail", "n_lines", "ctx_chars",
+	"len_chars", "len_words", "alnum_frac", "upper_frac", "digit_frac",
+	"indent", "indent_delta", "block_start", "header_dist", "header_bm25", "header_cover",
+	"nb_bm25_max", "nb_bm25_mean", "nb_cover_max", "nb_compound_max", "prev_bm25", "next_bm25",
+	"prev_blank", "next_blank",
+	"q_words", "q_terms", "q_found", "ctx_bm25_max",
+	"para_cover_max", "sec_cover", "prf_cover", "prf_compound",
+}
+
+// Feature indexes, in FeatureNames order.
+const (
+	fBm25 = iota
+	fBm25Norm
+	fBm25Rank
+	fBm25WinSum
+	fCoverWinSum
+	fBm25TailNorm
+	fCover
+	fCoverIdf
+	fCoverN
+	fCoverMaxidf
+	fCoverRank
+	fCoverTail
+	fCompoundHits
+	fCompoundMaxlen
+	fBigramHits
+	fTrigramHits
+	fIdfMean
+	fIdfMax
+	fUniqFrac
+	fKError
+	fKTest
+	fKPath
+	fKPathline
+	fKHeading
+	fKDiff
+	fKSection
+	fKSignature
+	fKJsonkey
+	fKSeparator
+	fKFrame
+	fKKv
+	fKBullet
+	fDup
+	fTmpl
+	fTmplFirst
+	fPosRel
+	fPosHead
+	fPosTail
+	fNLines
+	fCtxChars
+	fLenChars
+	fLenWords
+	fAlnumFrac
+	fUpperFrac
+	fDigitFrac
+	fIndent
+	fIndentDelta
+	fBlockStart
+	fHeaderDist
+	fHeaderBm25
+	fHeaderCover
+	fNbBm25Max
+	fNbBm25Mean
+	fNbCoverMax
+	fNbCompoundMax
+	fPrevBm25
+	fNextBm25
+	fPrevBlank
+	fNextBlank
+	fQWords
+	fQTerms
+	fQFound
+	fCtxBm25Max
+	fParaCoverMax
+	fSecCover
+	fPrfCover
+	fPrfCompound
+	nFeatures
+)
+
+const (
+	neighbourSpan = 3
+	compoundSpan  = 5
+	maxCompounds  = 64
+)
+
+// LineFeatures splits context at "\n" and returns its lines with one feature
+// row per line, nFeatures wide. Only the query's last maxQueryBytes count.
+// The result depends only on the inputs: map lookups never decide an order and
+// every float sum runs in line order.
+func LineFeatures(context, query string) ([]string, [][]float32) {
+	if cut := len(query) - maxQueryBytes; cut > 0 {
+		for cut < len(query) && !utf8.RuneStart(query[cut]) {
+			cut++
+		}
+		query = query[cut:]
+	}
+	lines := strings.Split(context, "\n")
+	n := len(lines)
+	rows := make([][]float32, n)
+	flat := make([]float32, n*nFeatures)
+	for i := range rows {
+		rows[i] = flat[i*nFeatures : (i+1)*nFeatures]
+	}
+
+	bm := bm25(query, lines)
+	tail := queryTail(query)
+	bmTail := bm
+	if tail != strings.TrimSpace(query) {
+		bmTail = bm25(tail, lines)
+	}
+	bmMax, tailMax := maxOf(bm), maxOf(bmTail)
+
+	// Term index over the lines: each line's distinct terms (words plus their
+	// camelCase, snake_case and digit parts) and how many lines hold each.
+	ids := map[string]int32{}
+	var df []int32
+	lineTerms := make([][]int32, n)
+	lineWords := make([][]string, n)
+	for i, line := range lines {
+		words, terms := tokenize(line)
+		lineWords[i] = words
+		set := make([]int32, 0, len(terms))
+		for _, t := range terms {
+			id, ok := ids[t]
+			if !ok {
+				id = int32(len(df))
+				ids[t] = id
+				df = append(df, 0)
+			}
+			set = append(set, id)
+		}
+		slices.Sort(set)
+		set = slices.Compact(set)
+		for _, id := range set {
+			df[id]++
+		}
+		lineTerms[i] = set
+	}
+	idf := make([]float64, len(df))
+	for id, d := range df {
+		idf[id] = math.Log(1 + (float64(n)-float64(d)+0.5)/(float64(d)+0.5))
+	}
+
+	qWords, qTerms := tokenize(query)
+	qTerms = dedupe(qTerms)
+	inQuery := make([]bool, len(df))
+	qIDFSum, found := 0.0, 0
+	for _, t := range qTerms {
+		if id, ok := ids[t]; ok {
+			inQuery[id] = true
+			qIDFSum += idf[id]
+			found++
+		}
+	}
+	_, tailTerms := tokenize(tail)
+	inTail := make([]bool, len(df))
+	tailIDFSum := 0.0
+	for _, t := range dedupe(tailTerms) {
+		if id, ok := ids[t]; ok {
+			inTail[id] = true
+			tailIDFSum += idf[id]
+		}
+	}
+	bigrams, trigrams := ngrams(qWords)
+	compounds := compoundTerms(query)
+
+	blank := make([]bool, n)
+	indent := make([]int, n)
+	tmplKeys := make([]string, n)
+	dupCount := map[string]int{}
+	tmplCount := map[string]int{}
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		blank[i] = trimmed == ""
+		indent[i] = indentOf(line)
+		dupCount[trimmed]++
+		tmplKeys[i] = template(trimmed)
+		tmplCount[tmplKeys[i]]++
+	}
+	prevNB, nextNB := nonBlankNeighbours(blank)
+	headers := blockHeaders(indent, blank)
+	tmplSeen := map[string]bool{}
+	cover := make([]float64, n)
+	compound := make([]float64, n)
+
+	for i, line := range lines {
+		r := rows[i]
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		set := lineTerms[i]
+
+		var cov, covIDF, covMax, idfSum, idfMax, uniq, tailIDF float64
+		for _, id := range set {
+			if inTail[id] {
+				tailIDF += idf[id]
+			}
+			idfSum += idf[id]
+			idfMax = max(idfMax, idf[id])
+			if df[id] == 1 {
+				uniq++
+			}
+			if inQuery[id] {
+				cov++
+				covIDF += idf[id]
+				covMax = max(covMax, idf[id])
+			}
+		}
+		var hits, longest float64
+		for _, c := range compounds {
+			if strings.Contains(lower, c) {
+				hits++
+				longest = max(longest, float64(len(c)))
+			}
+		}
+		var bi, tri float64
+		w := lineWords[i]
+		for j := 0; j+1 < len(w); j++ {
+			if bigrams[w[j]+" "+w[j+1]] {
+				bi++
+			}
+			if j+2 < len(w) && trigrams[w[j]+" "+w[j+1]+" "+w[j+2]] {
+				tri++
+			}
+		}
+		cover[i] = ratio(covIDF, qIDFSum)
+		compound[i] = hits
+
+		r[fBm25] = f(bm[i])
+		r[fBm25Norm] = f(ratio(bm[i], bmMax))
+		r[fCoverTail] = f(ratio(tailIDF, tailIDFSum))
+		r[fBm25TailNorm] = f(ratio(bmTail[i], tailMax))
+		r[fCover] = f(ratio(cov, float64(found)))
+		r[fCoverIdf] = f(cover[i])
+		r[fCoverN] = f(cov)
+		r[fCoverMaxidf] = f(covMax)
+		r[fCompoundHits] = f(hits)
+		r[fCompoundMaxlen] = f(math.Log1p(longest))
+		r[fBigramHits] = f(bi)
+		r[fTrigramHits] = f(tri)
+		if len(set) > 0 {
+			r[fIdfMean] = f(idfSum / float64(len(set)))
+			r[fUniqFrac] = f(uniq / float64(len(set)))
+		}
+		r[fIdfMax] = f(idfMax)
+		kinds := lineKinds(trimmed, lower)
+		copy(r[fKError:fKBullet+1], kinds[:])
+		r[fDup] = f(math.Log1p(float64(dupCount[trimmed] - 1)))
+		r[fTmpl] = f(math.Log1p(float64(tmplCount[tmplKeys[i]] - 1)))
+		if !tmplSeen[tmplKeys[i]] {
+			tmplSeen[tmplKeys[i]] = true
+			r[fTmplFirst] = 1
+		}
+		if n > 1 {
+			r[fPosRel] = f(float64(i) / float64(n-1))
+		}
+		r[fPosHead] = f(math.Log1p(float64(i)))
+		r[fPosTail] = f(math.Log1p(float64(n - 1 - i)))
+		r[fNLines] = f(math.Log1p(float64(n)))
+		r[fCtxChars] = f(math.Log1p(float64(len(context))))
+		r[fLenChars] = f(math.Log1p(float64(len(line))))
+		r[fLenWords] = f(math.Log1p(float64(len(strings.Fields(line)))))
+		alnum, upper, digit, total := charMix(trimmed)
+		if total > 0 {
+			r[fAlnumFrac] = f(alnum / total)
+			r[fUpperFrac] = f(upper / total)
+			r[fDigitFrac] = f(digit / total)
+		}
+		r[fIndent] = f(math.Log1p(float64(indent[i])))
+		if p := prevNB[i]; p >= 0 && !blank[i] {
+			r[fIndentDelta] = f(float64(indent[i] - indent[p]))
+		}
+		if nx := nextNB[i]; nx >= 0 && !blank[i] && indent[nx] > indent[i] {
+			r[fBlockStart] = 1
+		}
+		r[fQWords] = f(math.Log1p(float64(len(qWords))))
+		r[fQTerms] = f(math.Log1p(float64(len(qTerms))))
+		r[fQFound] = f(ratio(float64(found), float64(len(qTerms))))
+		r[fCtxBm25Max] = f(bmMax)
+	}
+
+	// Paragraphs (runs of non-blank lines), the nearest earlier heading, and
+	// feedback terms: rare terms of the three lines that cover the query best,
+	// which name the next hop (an entity, a callee, a file) the query does not.
+	paraMax := make([]float64, n)
+	for i := 0; i < n; {
+		j := i
+		best := 0.0
+		for j < n && !blank[j] {
+			best = max(best, cover[j])
+			j++
+		}
+		for k := i; k < j; k++ {
+			paraMax[k] = best
+		}
+		i = max(j, i+1)
+	}
+	byCover := make([]int, n)
+	for i := range byCover {
+		byCover[i] = i
+	}
+	sort.SliceStable(byCover, func(a, b int) bool { return cover[byCover[a]] > cover[byCover[b]] })
+	feedback := make([]bool, len(df))
+	fbSum := 0.0
+	for _, i := range byCover[:min(3, n)] {
+		if cover[i] == 0 {
+			break
+		}
+		for _, id := range lineTerms[i] {
+			if !inQuery[id] && !feedback[id] && df[id] <= max(2, int32(n/50)) {
+				feedback[id] = true
+				fbSum += idf[id]
+			}
+		}
+	}
+	// Structured identifiers (paths, dotted names, ids like pg-cart-98) the
+	// best lines name and the query does not: the next hop, verbatim.
+	inCompounds := map[string]bool{}
+	for _, c := range compounds {
+		inCompounds[c] = true
+	}
+	var hops []string
+	for _, i := range byCover[:min(3, n)] {
+		if cover[i] == 0 {
+			break
+		}
+		for _, c := range compoundTerms(lines[i]) {
+			if !inCompounds[c] && len(hops) < maxCompounds {
+				inCompounds[c] = true
+				hops = append(hops, c)
+			}
+		}
+	}
+	heading := -1
+	for i := range lines {
+		r := rows[i]
+		r[fParaCoverMax] = f(paraMax[i])
+		if heading >= 0 {
+			r[fSecCover] = f(cover[heading])
+		}
+		if rows[i][fKHeading] == 1 {
+			heading = i
+		}
+		fb := 0.0
+		for _, id := range lineTerms[i] {
+			if feedback[id] {
+				fb += idf[id]
+			}
+		}
+		r[fPrfCover] = f(ratio(fb, fbSum))
+		if len(hops) > 0 {
+			lower := strings.ToLower(lines[i])
+			hits := 0
+			for _, c := range hops {
+				if strings.Contains(lower, c) {
+					hits++
+				}
+			}
+			r[fPrfCompound] = f(float64(hits))
+		}
+	}
+
+	bmRank := rankFrac(bm)
+	covRank := rankFrac(cover)
+	for i := range lines {
+		r := rows[i]
+		r[fBm25Rank] = f(bmRank[i])
+		r[fCoverRank] = f(covRank[i])
+		if h := headers[i]; h >= 0 {
+			r[fHeaderDist] = f(math.Log1p(float64(i - h)))
+			r[fHeaderBm25] = f(ratio(bm[h], bmMax))
+			r[fHeaderCover] = f(cover[h])
+		}
+		var winBM, winCov float64
+		for j := max(0, i-2); j <= min(n-1, i+2); j++ {
+			winBM += ratio(bm[j], bmMax)
+			winCov += cover[j]
+		}
+		r[fBm25WinSum] = f(winBM)
+		r[fCoverWinSum] = f(winCov)
+		var nbMax, nbSum, covNb, compNb float64
+		cnt := 0
+		for j := max(0, i-neighbourSpan); j <= min(n-1, i+neighbourSpan); j++ {
+			if j == i {
+				continue
+			}
+			v := ratio(bm[j], bmMax)
+			nbMax = max(nbMax, v)
+			nbSum += v
+			covNb = max(covNb, cover[j])
+			cnt++
+		}
+		for j := max(0, i-compoundSpan); j <= min(n-1, i+compoundSpan); j++ {
+			if j != i {
+				compNb = max(compNb, compound[j])
+			}
+		}
+		r[fNbBm25Max] = f(nbMax)
+		if cnt > 0 {
+			r[fNbBm25Mean] = f(nbSum / float64(cnt))
+		}
+		r[fNbCoverMax] = f(covNb)
+		r[fNbCompoundMax] = f(compNb)
+		if i > 0 {
+			r[fPrevBm25] = f(ratio(bm[i-1], bmMax))
+			if blank[i-1] {
+				r[fPrevBlank] = 1
+			}
+		}
+		if i+1 < n {
+			r[fNextBm25] = f(ratio(bm[i+1], bmMax))
+			if blank[i+1] {
+				r[fNextBlank] = 1
+			}
+		}
+	}
+	return lines, rows
+}
+
+func f(x float64) float32 { return float32(x) }
+
+func ratio(a, b float64) float64 {
+	if b <= 0 {
+		return 0
+	}
+	return a / b
+}
+
+func maxOf(v []float64) float64 {
+	m := 0.0
+	for _, x := range v {
+		m = max(m, x)
+	}
+	return m
+}
+
+// rankFrac gives each value the share of values strictly greater than it.
+func rankFrac(v []float64) []float64 {
+	order := make([]int, len(v))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return v[order[a]] > v[order[b]] })
+	out := make([]float64, len(v))
+	greater := 0
+	for k, i := range order {
+		if k > 0 && v[i] < v[order[k-1]] {
+			greater = k
+		}
+		out[i] = float64(greater) / float64(max(1, len(v)))
+	}
+	return out
+}
+
+// queryTail is the query's last three non-empty lines: in an agent turn the
+// intent and the tool call that the context answers.
+func queryTail(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	var tail []string
+	for i := len(lines) - 1; i >= 0 && len(tail) < 3; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			tail = append(tail, t)
+		}
+	}
+	slices.Reverse(tail)
+	return strings.Join(tail, "\n")
+}
+
+// stopwords matches the engine's BM25 stop list.
+var stopwords = map[string]bool{
+	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
+	"be": true, "by": true, "for": true, "from": true, "how": true, "in": true,
+	"is": true, "it": true, "of": true, "on": true, "or": true, "that": true,
+	"the": true, "this": true, "to": true, "was": true, "what": true, "when": true,
+	"where": true, "which": true, "who": true, "why": true, "with": true,
+}
+
+// tokenize returns the lowercased words of s (runs of letters, digits and
+// underscores, two or more characters, stop words dropped) in order, and the
+// words together with their camelCase, snake_case and letter/digit parts.
+func tokenize(s string) (words, terms []string) {
+	start := -1
+	flush := func(end int) {
+		if start < 0 {
+			return
+		}
+		raw := s[start:end]
+		start = -1
+		word := strings.ToLower(raw)
+		if len(word) < 2 || stopwords[word] {
+			return
+		}
+		words = append(words, word)
+		terms = append(terms, word)
+		if !mayHaveParts(raw) {
+			return
+		}
+		if parts := splitIdent([]rune(raw)); len(parts) > 1 {
+			for _, p := range parts {
+				if len(p) >= 2 && !stopwords[p] {
+					terms = append(terms, p)
+				}
+			}
+		}
+	}
+	for i, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			if start < 0 {
+				start = i
+			}
+		} else {
+			flush(i)
+		}
+	}
+	flush(len(s))
+	return words, terms
+}
+
+// mayHaveParts is false only for words splitIdent leaves whole: all ASCII
+// with no underscore, no capital and no letter/digit change.
+func mayHaveParts(w string) bool {
+	digits, others := false, false
+	for i := 0; i < len(w); i++ {
+		c := w[i]
+		switch {
+		case c >= 0x80 || c == '_' || c >= 'A' && c <= 'Z':
+			return true
+		case c >= '0' && c <= '9':
+			digits = true
+		default:
+			others = true
+		}
+	}
+	return digits && others
+}
+
+// splitIdent cuts an identifier at underscores, lower-to-upper case changes,
+// the last capital of a capital run before a lowercase letter, and
+// letter/digit changes, and lowercases the parts.
+func splitIdent(w []rune) []string {
+	var parts []string
+	start := 0
+	cut := func(end int) {
+		if end > start {
+			parts = append(parts, strings.ToLower(string(w[start:end])))
+		}
+		start = end
+	}
+	for i := 0; i < len(w); i++ {
+		if w[i] == '_' {
+			cut(i)
+			start = i + 1
+			continue
+		}
+		if i == start || i == 0 {
+			continue
+		}
+		prev, r := w[i-1], w[i]
+		switch {
+		case unicode.IsLower(prev) && unicode.IsUpper(r):
+			cut(i)
+		case unicode.IsUpper(prev) && unicode.IsUpper(r) && i+1 < len(w) && unicode.IsLower(w[i+1]):
+			cut(i)
+		case unicode.IsDigit(prev) != unicode.IsDigit(r) && prev != '_':
+			cut(i)
+		}
+	}
+	cut(len(w))
+	return parts
+}
+
+func dedupe(s []string) []string {
+	seen := map[string]bool{}
+	out := s[:0:0]
+	for _, x := range s {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func ngrams(words []string) (bi, tri map[string]bool) {
+	bi, tri = map[string]bool{}, map[string]bool{}
+	for j := 0; j+1 < len(words); j++ {
+		bi[words[j]+" "+words[j+1]] = true
+		if j+2 < len(words) {
+			tri[words[j]+" "+words[j+1]+" "+words[j+2]] = true
+		}
+	}
+	return bi, tri
+}
+
+// compoundTerms returns the query's identifiers that carry structure (dotted
+// names, paths, snake_case, camelCase, flags), lowercased, first 64 distinct.
+func compoundTerms(query string) []string {
+	fields := strings.FieldsFunc(query, func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune("\"'`()[]{}<>,;=|", r)
+	})
+	var out []string
+	seen := map[string]bool{}
+	for _, fld := range fields {
+		fld = strings.Trim(fld, ".:!?*#")
+		if len(fld) < 4 || seen[fld] {
+			continue
+		}
+		structured := strings.ContainsAny(fld, "._/:-\\")
+		for i := 1; i < len(fld) && !structured; i++ {
+			structured = fld[i-1] >= 'a' && fld[i-1] <= 'z' && fld[i] >= 'A' && fld[i] <= 'Z'
+		}
+		if !structured {
+			continue
+		}
+		seen[fld] = true
+		out = append(out, strings.ToLower(fld))
+		if len(out) == maxCompounds {
+			break
+		}
+	}
+	return out
+}
+
+// template masks digit runs and long hex runs so repeated log lines that
+// differ only in numbers, ids or timestamps share one key.
+func template(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			for i < len(s) && (isHex(s[i]) || s[i] == '.' || s[i] == ':') {
+				i++
+			}
+			b.WriteByte('0')
+			continue
+		}
+		if isHex(c) {
+			j := i
+			for j < len(s) && isHex(s[j]) {
+				j++
+			}
+			if j-i >= 8 {
+				b.WriteByte('0')
+				i = j
+				continue
+			}
+		}
+		b.WriteByte(lowerASCII(c))
+		i++
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
+
+func indentOf(line string) int {
+	n := 0
+	for _, r := range line {
+		switch r {
+		case ' ':
+			n++
+		case '\t':
+			n += 4
+		default:
+			return n
+		}
+	}
+	return n
+}
+
+func nonBlankNeighbours(blank []bool) (prev, next []int) {
+	prev, next = make([]int, len(blank)), make([]int, len(blank))
+	last := -1
+	for i := range blank {
+		prev[i] = last
+		if !blank[i] {
+			last = i
+		}
+	}
+	last = -1
+	for i := len(blank) - 1; i >= 0; i-- {
+		next[i] = last
+		if !blank[i] {
+			last = i
+		}
+	}
+	return prev, next
+}
+
+// blockHeaders gives each non-blank line the nearest earlier non-blank line
+// with a smaller indent (its enclosing block's header), or -1.
+func blockHeaders(indent []int, blank []bool) []int {
+	out := make([]int, len(indent))
+	var stack []int
+	for i := range indent {
+		out[i] = -1
+		if blank[i] {
+			continue
+		}
+		for len(stack) > 0 && indent[stack[len(stack)-1]] >= indent[i] {
+			stack = stack[:len(stack)-1]
+		}
+		if len(stack) > 0 {
+			out[i] = stack[len(stack)-1]
+		}
+		stack = append(stack, i)
+	}
+	return out
+}
+
+func charMix(s string) (alnum, upper, digit, total float64) {
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		total++
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			alnum++
+		}
+		if unicode.IsUpper(r) {
+			upper++
+		}
+		if unicode.IsDigit(r) {
+			digit++
+		}
+	}
+	return
+}
+
+var (
+	errorWords   = []string{"error", "exception", "traceback", "fatal", "panic", "fail", "assert", "warning", "denied", "refused", "not found", "cannot", "unable to", "invalid", "segmentation", "undefined", "unexpected", "errno", "critical"}
+	testWords    = []string{" passed", " failed", " skipped", "xfail", "test session", "test summary"}
+	testPrefixes = []string{"ok ", "fail", "pass", "=== run", "--- pass", "--- fail", "ran "}
+	sigWords     = []string{"def ", "async def ", "class ", "func ", "function ", "fn ", "pub ", "struct ", "interface ", "type ", "impl ", "public ", "private ", "protected ", "static ", "export ", "module ", "package ", "import ", "from ", "#include", "const ", "var ", "let ", "@"}
+)
+
+// lineKinds returns the k_* flags, fKError through fKBullet.
+func lineKinds(trimmed, lower string) [fKBullet - fKError + 1]float32 {
+	var k [fKBullet - fKError + 1]float32
+	set := func(i int, ok bool) {
+		if ok {
+			k[i-fKError] = 1
+		}
+	}
+	if trimmed == "" {
+		return k
+	}
+	body := stripLineNumber(lower)
+	set(fKError, containsAny(lower, errorWords))
+	set(fKTest, containsAny(body, testWords) || hasAnyPrefix(body, testPrefixes))
+	set(fKPath, hasPath(trimmed))
+	set(fKPathline, hasPathLine(trimmed))
+	set(fKHeading, strings.HasPrefix(body, "#") && strings.HasPrefix(strings.TrimLeft(body, "#"), " "))
+	set(fKDiff, strings.HasPrefix(body, "diff --git") || strings.HasPrefix(body, "@@") ||
+		strings.HasPrefix(body, "+++ ") || strings.HasPrefix(body, "--- a/") || strings.HasPrefix(body, "index "))
+	set(fKSection, isSection(body, trimmed))
+	set(fKSignature, hasAnyPrefix(body, sigWords))
+	set(fKJsonkey, strings.HasPrefix(body, `"`) && strings.Contains(body, `":`))
+	set(fKSeparator, len(body) >= 3 && strings.IndexFunc(body, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) < 0)
+	set(fKFrame, strings.Contains(lower, `file "`) && strings.Contains(lower, ", line ") ||
+		strings.HasPrefix(body, "at ") && strings.Contains(body, "(") || strings.HasPrefix(body, "goroutine "))
+	set(fKKv, isKeyValue(body))
+	set(fKBullet, hasAnyPrefix(body, []string{"- ", "* ", "• ", "+ "}) || numbered(body))
+	return k
+}
+
+// stripLineNumber drops a leading "123 ", "123:" or "123|" line-number prefix
+// as tools print it.
+func stripLineNumber(s string) string {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 || i == len(s) || !strings.ContainsRune(" \t:|", rune(s[i])) {
+		return s
+	}
+	return strings.TrimSpace(s[i+1:])
+}
+
+func containsAny(s string, words []string) bool {
+	for _, w := range words {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPath(s string) bool {
+	if !strings.ContainsAny(s, "/\\") {
+		return false
+	}
+	for _, fld := range strings.Fields(s) {
+		fld = strings.Trim(fld, "\"'`(),;:[]")
+		slash := strings.LastIndexAny(fld, "/\\")
+		if slash >= 0 && slash < len(fld)-1 && strings.Contains(fld[slash:], ".") && strings.IndexFunc(fld, unicode.IsLetter) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPathLine finds "name.ext:123", the way compilers, tests and grep cite a
+// line.
+func hasPathLine(s string) bool {
+	for i := 1; i+1 < len(s); i++ {
+		if s[i] != ':' || s[i+1] < '0' || s[i+1] > '9' {
+			continue
+		}
+		j := i
+		for j > 0 && i-j < 6 && (s[j-1] >= 'a' && s[j-1] <= 'z' || s[j-1] >= 'A' && s[j-1] <= 'Z') {
+			j--
+		}
+		if j < i && j >= 2 && s[j-1] == '.' && s[j-2] != '.' && s[j-2] != ' ' {
+			return true
+		}
+	}
+	return false
+}
+
+func isSection(body, trimmed string) bool {
+	if strings.HasPrefix(body, "[") && strings.HasSuffix(body, "]") || strings.HasPrefix(body, "==>") || strings.HasPrefix(body, "file:") {
+		return true
+	}
+	if len(body) < 80 && strings.HasSuffix(body, ":") && !strings.ContainsAny(body, "(){}=") {
+		return true
+	}
+	letters, uppers := 0, 0
+	for _, r := range trimmed {
+		if unicode.IsLetter(r) {
+			letters++
+			if unicode.IsUpper(r) {
+				uppers++
+			}
+		}
+	}
+	return letters >= 4 && letters == uppers && len(trimmed) < 60
+}
+
+func isKeyValue(body string) bool {
+	i := 0
+	for i < len(body) && (body[i] == '_' || body[i] == '.' || body[i] == '-' || body[i] >= 'a' && body[i] <= 'z' || body[i] >= '0' && body[i] <= '9') {
+		i++
+	}
+	if i == 0 {
+		return false
+	}
+	for i < len(body) && body[i] == ' ' {
+		i++
+	}
+	return i+1 < len(body) && (body[i] == ':' || body[i] == '=') && body[i+1] != '='
+}
+
+func numbered(body string) bool {
+	i := 0
+	for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+		i++
+	}
+	return i > 0 && i+1 < len(body) && (body[i] == '.' || body[i] == ')') && body[i+1] == ' '
+}
+</file>
+
+<file path="go.mod">
+module github.com/caveman-ai/trim-1
+
+go 1.23
+</file>
+
+<file path="LICENSE">
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+</file>
+
+<file path="LICENSE-go">
+Copyright 2009 The Go Authors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google LLC nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+</file>
+
+<file path="model.go">
+package trim
+
+import (
+	"bytes"
+	_ "embed"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+)
+
+// model.bin holds the gradient-boosted trees trained with
+// LightGBM. Layout, little endian: "KEEP", version
+// uint32 (1), features, trees, nodes, leaves (uint32 each); then each feature
+// name as uint16 length + bytes; tree roots []int32; node feature []int32,
+// threshold []float64, left []int32, right []int32; leaf values []float64.
+// A child or root below zero is the leaf ^index. A node sends a row left when
+// float64(row[feature]) <= threshold, as LightGBM does with no missing values.
+//
+//go:embed model.bin
+var modelBytes []byte
+
+type forest struct {
+	roots []int32
+	nodes []node
+	leaf  []float64
+}
+
+// node is one split. threshold is the largest float32 not above the
+// model's float64 threshold, so row[feature] <= threshold decides exactly as
+// float64(row[feature]) <= the float64 threshold does.
+type node struct {
+	threshold   float32
+	feature     int32
+	left, right int32
+}
+
+var (
+	loadOnce  sync.Once
+	loaded    *forest
+	loadError error
+)
+
+func model() (*forest, error) {
+	loadOnce.Do(func() { loaded, loadError = parseModel(modelBytes) })
+	return loaded, loadError
+}
+
+func parseModel(b []byte) (*forest, error) {
+	r := bytes.NewReader(b)
+	var head struct {
+		Magic                                   [4]byte
+		Version, Features, Trees, Nodes, Leaves uint32
+	}
+	if err := binary.Read(r, binary.LittleEndian, &head); err != nil {
+		return nil, fmt.Errorf("trim model header: %w", err)
+	}
+	if string(head.Magic[:]) != "KEEP" || head.Version != 1 {
+		return nil, errors.New("trim model: bad magic or version")
+	}
+	if int(head.Features) != nFeatures || head.Trees == 0 || head.Nodes > 1<<24 || head.Leaves > 1<<24 {
+		return nil, fmt.Errorf("trim model: %d features, %d trees, %d nodes, %d leaves (package computes %d features)",
+			head.Features, head.Trees, head.Nodes, head.Leaves, nFeatures)
+	}
+	// Check the size the header implies before allocating anything it sizes.
+	size := 24 + 4*uint64(head.Trees) + 20*uint64(head.Nodes) + 8*uint64(head.Leaves)
+	for _, name := range FeatureNames {
+		size += 2 + uint64(len(name))
+	}
+	if size != uint64(len(b)) {
+		return nil, fmt.Errorf("trim model: header implies %d bytes, model has %d", size, len(b))
+	}
+	for i := range nFeatures {
+		var n uint16
+		if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+			return nil, fmt.Errorf("trim model feature names: %w", err)
+		}
+		name := make([]byte, n)
+		if _, err := r.Read(name); err != nil || string(name) != FeatureNames[i] {
+			return nil, fmt.Errorf("trim model feature %d is %q, package has %q", i, name, FeatureNames[i])
+		}
+	}
+	roots := make([]int32, head.Trees)
+	feature := make([]int32, head.Nodes)
+	threshold := make([]float64, head.Nodes)
+	left := make([]int32, head.Nodes)
+	right := make([]int32, head.Nodes)
+	leaf := make([]float64, head.Leaves)
+	for _, part := range []any{roots, feature, threshold, left, right, leaf} {
+		if err := binary.Read(r, binary.LittleEndian, part); err != nil {
+			return nil, fmt.Errorf("trim model body: %w", err)
+		}
+	}
+	if r.Len() != 0 {
+		return nil, fmt.Errorf("trim model: %d trailing bytes", r.Len())
+	}
+	nodes, leaves := int32(head.Nodes), int32(head.Leaves)
+	valid := func(c int32) bool { return c >= 0 && c < nodes || c < 0 && ^c < leaves }
+	for _, c := range roots {
+		if !valid(c) {
+			return nil, errors.New("trim model: root out of range")
+		}
+	}
+	m := &forest{roots: roots, nodes: make([]node, head.Nodes), leaf: leaf}
+	for i := range feature {
+		// Children point forward, so a walk always ends at a leaf.
+		if feature[i] < 0 || int(feature[i]) >= nFeatures || !valid(left[i]) || !valid(right[i]) ||
+			left[i] >= 0 && left[i] <= int32(i) || right[i] >= 0 && right[i] <= int32(i) ||
+			math.IsNaN(threshold[i]) {
+			return nil, fmt.Errorf("trim model: node %d out of range", i)
+		}
+		t := float32(threshold[i])
+		if float64(t) > threshold[i] {
+			t = math.Nextafter32(t, float32(math.Inf(-1)))
+		}
+		m.nodes[i] = node{threshold: t, feature: feature[i], left: left[i], right: right[i]}
+	}
+	return m, nil
+}
+
+// raw is the sum of the trees' leaf values for one row, trees in order.
+func (m *forest) raw(row []float32) float64 {
+	sum := 0.0
+	for _, i := range m.roots {
+		for i >= 0 {
+			nd := &m.nodes[i]
+			if row[nd.feature] <= nd.threshold {
+				i = nd.left
+			} else {
+				i = nd.right
+			}
+		}
+		sum += m.leaf[^i]
+	}
+	return sum
+}
+
+// Probability is the model's keep probability for one feature row.
+func (m *forest) probability(row []float32) float64 {
+	return 1 / (1 + exp(-m.raw(row)))
+}
+
+// exp and expmulti are math.Exp's portable code from Go's src/math/exp.go.
+// math.Exp runs assembly on amd64 and arm64 and this code on wasm, and the
+// results differ in the last bit; float64() around each product stops the
+// compiler fusing a multiply-add, so every architecture rounds alike.
+//
+// Copyright 2009 The Go Authors. All rights reserved. Use of this source code
+// is governed by a BSD-style license that can be found in the LICENSE-go file.
+// From FreeBSD's e_exp.c: Copyright (C) 2004 by Sun Microsystems, Inc. All
+// rights reserved. Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice is preserved.
+func exp(x float64) float64 {
+	const (
+		Ln2Hi = 6.93147180369123816490e-01
+		Ln2Lo = 1.90821492927058770002e-10
+		Log2e = 1.44269504088896338700e+00
+
+		Overflow  = 7.09782712893383973096e+02
+		Underflow = -7.45133219101941108420e+02
+		NearZero  = 1.0 / (1 << 28) // 2**-28
+	)
+
+	// special cases
+	switch {
+	case math.IsNaN(x):
+		return x
+	case x > Overflow: // handles case where x is +∞
+		return math.Inf(1)
+	case x < Underflow: // handles case where x is -∞
+		return 0
+	case -NearZero < x && x < NearZero:
+		return 1 + x
+	}
+
+	// reduce; computed as r = hi - lo for extra precision.
+	var k int
+	switch {
+	case x < 0:
+		k = int(float64(Log2e*x) - 0.5)
+	case x > 0:
+		k = int(float64(Log2e*x) + 0.5)
+	}
+	hi := x - float64(float64(k)*Ln2Hi)
+	lo := float64(k) * Ln2Lo
+
+	// compute
+	return expmulti(hi, lo, k)
+}
+
+// expmulti returns e**r × 2**k where r = hi - lo and |r| ≤ ln(2)/2.
+func expmulti(hi, lo float64, k int) float64 {
+	const (
+		P1 = 1.66666666666666657415e-01  /* 0x3FC55555; 0x55555555 */
+		P2 = -2.77777777770155933842e-03 /* 0xBF66C16C; 0x16BEBD93 */
+		P3 = 6.61375632143793436117e-05  /* 0x3F11566A; 0xAF25DE2C */
+		P4 = -1.65339022054652515390e-06 /* 0xBEBBBD41; 0xC5D26BF1 */
+		P5 = 4.13813679705723846039e-08  /* 0x3E663769; 0x72BEA4D0 */
+	)
+
+	r := hi - lo
+	t := r * r
+	c := r - float64(t*(P1+float64(t*(P2+float64(t*(P3+float64(t*(P4+float64(t*P5)))))))))
+	y := 1 - ((lo - float64(r*c)/(2-c)) - hi)
+	return math.Ldexp(y, k)
+}
+
+// ModelInfo describes the embedded model for logs and reports.
+func ModelInfo() (string, error) {
+	m, err := model()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d trees, %d nodes, %d features, %d bytes", len(m.roots), len(m.nodes), nFeatures, len(modelBytes)), nil
+}
+</file>
+
+<file path="README.md">
+<div align="center">
+
+<a href="https://github.com/caveman-ai/trim-1"><img src="docs/assets/banner.png" alt="Caveman / trim-1. The word TRIM-1 in solid pixel letters with a double-line shadow. Why read many line when few do trick. Agent read whole log to find one error. trim-1 keep the lines the ask need and drop the rest. Every kept line exact, nothing rewritten. Say this to shell: trim --query &quot;why fail&quot; build.log. How big is rock: 1.2 MB model, 7 ms for 5k tokens on one core, 0 GPUs" width="880"></a>
+
+</div>
+
+# trim-1
+
+trim-1 is a small model that decides which lines of a context an AI agent
+needs for its current ask, and drops the rest.
+
+Give it a context (a tool result, a file, a log, a long chat) and the current
+query. It returns the context's own lines, in their original order, with a
+short marker wherever lines were removed. It never rewrites or summarizes a
+line, so identifiers, paths and error text come through exactly as they were.
+
+- **1.2 MB.** 712 gradient-boosted trees, not a neural network.
+- **Milliseconds on one CPU core.** No GPU, no network call.
+- **Deterministic.** No sampling and no randomness: the same context and query
+  give the same output.
+- **No dependencies.** Pure Go, standard library only. The model is embedded.
+
+The model card, with benchmark results and limits, is on Hugging Face:
+[caveman-so/trim-1](https://huggingface.co/caveman-so/trim-1).
+
+## Install
+
+Needs Go 1.23 or newer.
+
+```bash
+go install github.com/caveman-ai/trim-1/cmd/trim@latest
+```
+
+## Use
+
+From the command line:
+
+```bash
+trim --query "why does the build fail" build.log > build.trimmed.log
+```
+
+```bash
+cat long-document.md | trim --query "what is the refund policy" --point balanced
+```
+
+The trimmed context goes to stdout. A one-line summary goes to stderr:
+
+```
+trim: kept 246 lines, removed 189, 47831 -> 36344 bytes
+```
+
+From Go:
+
+```go
+import trim "github.com/caveman-ai/trim-1"
+
+res := trim.Compress(context, query, trim.Options{Point: "balanced"})
+fmt.Print(res.Output)
+```
+
+`trim.Score(context, query)` returns every line with its keep probability, if
+you want to make the selection yourself.
+
+## Which setting to use
+
+`--point` decides how hard trim-1 cuts: `conservative`, `balanced` (the
+default) or `aggressive`. Cutting harder costs quality, because every removed
+line is one the model can no longer read.
+
+- **Long-document retrieval** is what trim-1 is for. Use `balanced`.
+- **Coding-agent tool outputs** are short and dense. Stay at `balanced` or
+  `conservative` and expect small savings.
+
+The [model card](https://huggingface.co/caveman-so/trim-1#which-setting-to-use)
+has the numbers behind this.
+
+## When it does nothing
+
+trim-1 fails closed. It returns the context unchanged, and says why on stderr,
+when:
+
+- the query is blank,
+- the context is under 2,000 bytes,
+- the context is over 8 MiB or 200,000 lines,
+- the context already has a removal marker line, such as trim-1's own output,
+- the cut would remove less than 10% of the bytes.
+
+The `trim` command exits with status 2 on a missing `--query` or an unknown
+`--point`. Flags go before the file name.
+
+## Test
+
+```bash
+go test ./...
+```
+
+`TestPredictionParity` checks the Go tree evaluation against the training
+library's own predictions, bit for bit. `TestGolden` pins the full output on a
+sample log.
+
+## License
+
+Apache-2.0. `model.go` includes a copy of Go's `math.Exp`, under the BSD license
+in `LICENSE-go`. trim-1 is the model inside
+[Caveman](https://github.com/JuliusBrussee/caveman).
+</file>
+
+<file path="trim_test.go">
+package trim
+
+import (
+	"encoding/binary"
+	"flag"
+	"fmt"
+	"math"
+	"os"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+)
+
+var update = flag.Bool("update", false, "rewrite testdata/golden.txt")
+
+func logContext() string {
+	var b strings.Builder
+	b.WriteString("$ kubectl logs deploy/checkout --since=1h\n")
+	for i := range 400 {
+		fmt.Fprintf(&b, "2026-10-11T03:%02d:%02dZ INFO checkout request %d served in %dms\n", i/60%60, i%60, 1000+i, 10+i%17)
+		if i == 271 {
+			b.WriteString("2026-10-11T03:04:31Z ERROR payment client: ledger-db timeout after 30s (order 1271)\n")
+			b.WriteString("    at LedgerClient.charge (ledger/client.go:88)\n")
+		}
+	}
+	b.WriteString("exit status 1\n")
+	return b.String()
+}
+
+const logQuery = "Why did the checkout payment fail? Find the ledger error."
+
+func TestDeterministicVerbatimInOrder(t *testing.T) {
+	ctx := logContext()
+	a := Compress(ctx, logQuery, Options{})
+	b := Compress(ctx, logQuery, Options{})
+	if a.Output != b.Output || a.KeptLines != b.KeptLines {
+		t.Fatal("two calls on the same input differ")
+	}
+	if a.Unchanged {
+		t.Fatalf("log context returned unchanged: %s", a.Reason)
+	}
+	if !strings.HasSuffix(a.Output, "\n") {
+		t.Fatal("the context's final newline was dropped")
+	}
+	lines := strings.Split(strings.TrimSuffix(ctx, "\n"), "\n")
+	next, kept := 0, 0
+	for _, out := range strings.Split(strings.TrimSuffix(a.Output, "\n"), "\n") {
+		if strings.HasPrefix(out, "… ") && strings.HasSuffix(out, " …") {
+			continue
+		}
+		for next < len(lines) && lines[next] != out {
+			next++
+		}
+		if next == len(lines) {
+			t.Fatalf("output line %q is not a later line of the input", out)
+		}
+		next++
+		kept++
+	}
+	if kept != a.KeptLines || a.KeptLines+a.RemovedLines != len(lines) {
+		t.Fatalf("kept %d, result says %d kept + %d removed of %d", kept, a.KeptLines, a.RemovedLines, len(lines))
+	}
+	if !strings.Contains(a.Output, "ledger-db timeout") {
+		t.Fatalf("the error line the query asks for was dropped:\n%s", a.Output)
+	}
+}
+
+func TestRefusals(t *testing.T) {
+	ctx := logContext()
+	for name, tc := range map[string]struct {
+		context, query string
+		opts           Options
+		reason         string
+	}{
+		"unknown point": {ctx, logQuery, Options{Point: "turbo"}, "unknown operating point"},
+		"small input":   {"one line\ntwo lines\n", logQuery, Options{}, "context below the minimum size"},
+		"cut too small": {ctx, logQuery, Options{Policy: &Policy{MinCut: 1}}, "cut below the minimum"},
+		"blank query":   {ctx, " \n\t ", Options{}, "no query"},
+		"over 8 MiB":    {strings.Repeat(ctx, maxContextBytes/len(ctx)+1), logQuery, Options{}, "context over 8 MiB"},
+		"many lines":    {strings.Repeat("x\n", maxContextLines+1), logQuery, Options{}, "context over 200,000 lines"},
+		"marker line":   {strings.Replace(ctx, "exit status 1", "… 3 lines …", 1), logQuery, Options{}, "context has a line that reads as an elision marker"},
+	} {
+		res := Compress(tc.context, tc.query, tc.opts)
+		if !res.Unchanged || res.Output != tc.context || res.Reason != tc.reason {
+			t.Errorf("%s: want the input back unchanged for %q, got unchanged=%v reason=%q", name, tc.reason, res.Unchanged, res.Reason)
+		}
+	}
+}
+
+// Only the query's last 8 KiB count: text before it changes nothing.
+func TestQueryCap(t *testing.T) {
+	ctx := logContext()
+	tail := strings.Repeat("é", maxQueryBytes) + logQuery // the cut lands inside an "é"
+	_, a := LineFeatures(ctx, "ledger payment "+tail)
+	_, b := LineFeatures(ctx, "checkout timeout "+tail)
+	if !reflect.DeepEqual(a, b) {
+		t.Fatal("text before the query's last 8 KiB changed the features")
+	}
+}
+
+// The empty piece after a final "\n" is not a line: it is never in a marker,
+// and the output keeps the final newline.
+func TestFinalNewlineIsNotALine(t *testing.T) {
+	lines := strings.Split("a\nb\nc\nd\n", "\n")
+	p := Policy{Floor: 1, TopK: 1}
+	for _, tc := range []struct {
+		scores []float64
+		want   string
+	}{
+		{[]float64{1, 0, 0, 0, 0}, "a\n… 3 lines …\n"},
+		{[]float64{0, 0, 0, 1, 0}, "… 3 lines …\nd\n"},
+	} {
+		if out, kept := p.Apply(lines, tc.scores); out != tc.want || kept != 1 {
+			t.Errorf("got %q with %d kept, want %q with 1", out, kept, tc.want)
+		}
+	}
+}
+
+func TestGolden(t *testing.T) {
+	got := Compress(logContext(), logQuery, Options{}).Output
+	path := "testdata/golden.txt"
+	if *update {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Fatalf("output changed; run go test -update after a deliberate model or policy change\n got:\n%s", got)
+	}
+}
+
+func TestModelLoads(t *testing.T) {
+	if len(FeatureNames) != nFeatures {
+		t.Fatalf("%d feature names, %d feature slots", len(FeatureNames), nFeatures)
+	}
+	m, err := model()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.roots) < 10 {
+		t.Fatalf("embedded model has %d trees", len(m.roots))
+	}
+	if _, err := parseModel(modelBytes[:len(modelBytes)-1]); err == nil {
+		t.Fatal("a truncated model parsed")
+	}
+}
+
+// A header that does not match the model's size fails before anything it
+// sizes is allocated.
+func TestModelHeaderBounds(t *testing.T) {
+	huge := slices.Clone(modelBytes)
+	binary.LittleEndian.PutUint32(huge[12:], 0xFFFFFFF0) // trees
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for name, b := range map[string][]byte{"truncated header": modelBytes[:20], "header only": modelBytes[:24], "huge tree count": huge} {
+		if _, err := parseModel(b); err == nil {
+			t.Errorf("%s parsed", name)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if n := after.TotalAlloc - before.TotalAlloc; n > 1<<20 {
+		t.Fatalf("parsing bad headers allocated %d bytes", n)
+	}
+}
+
+// TestPredictionParity replays rows LightGBM scored at export time
+// (the training script writes testdata/parity.bin with the model) and wants the same
+// raw scores, bit for bit.
+func TestPredictionParity(t *testing.T) {
+	b, err := os.ReadFile("testdata/parity.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, width := int(binary.LittleEndian.Uint32(b)), int(binary.LittleEndian.Uint32(b[4:]))
+	if width != nFeatures || len(b) != 8+n*width*4+n*8 {
+		t.Fatalf("parity fixture: %d rows of %d features in %d bytes", n, width, len(b))
+	}
+	m, err := model()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, raws := b[8:8+n*width*4], b[8+n*width*4:]
+	row := make([]float32, width)
+	for i := range n {
+		for j := range row {
+			row[j] = math.Float32frombits(binary.LittleEndian.Uint32(rows[(i*width+j)*4:]))
+		}
+		want := math.Float64frombits(binary.LittleEndian.Uint64(raws[i*8:]))
+		if got := m.raw(row); got != want {
+			t.Fatalf("row %d: Go %v, LightGBM %v", i, got, want)
+		}
+	}
+}
+
+// benchContext mixes log, code and prose lines up to about n cl100k tokens
+// (four bytes a token).
+func benchContext(n int) string {
+	var b strings.Builder
+	for i := 0; b.Len() < 4*n; i++ {
+		switch i % 4 {
+		case 0:
+			fmt.Fprintf(&b, "2026-10-11T03:%02d:%02dZ INFO worker-%d processed batch %d in %dms\n", i/60%60, i%60, i%7, i, 10+i%31)
+		case 1:
+			fmt.Fprintf(&b, "    def handle_%d(self, request, retries=%d):\n", i, i%5)
+		case 2:
+			fmt.Fprintf(&b, "        return self.client.fetch(request.path, timeout=%d)  # see docs/api_%d.md\n", i%30, i)
+		default:
+			fmt.Fprintf(&b, "The scheduler moved shard %d to node %d after the health check reported latency above budget.\n", i, i%13)
+		}
+	}
+	return b.String()
+}
+
+func benchmarkCompress(b *testing.B, tokens int) {
+	ctx := benchContext(tokens)
+	Compress(ctx, logQuery, Options{})
+	b.ResetTimer()
+	for range b.N {
+		Compress(ctx, logQuery, Options{})
+	}
+}
+
+func BenchmarkCompress2k(b *testing.B)  { benchmarkCompress(b, 2000) }
+func BenchmarkCompress50k(b *testing.B) { benchmarkCompress(b, 50000) }
+</file>
+
+<file path="trim.go">
+// Package trim is query-aware context compression: given a context and the
+// current ask it returns a verbatim subset of the context's lines, in their
+// original order, with one short marker line where lines were removed. It
+// never rewrites a line.
+//
+// Each line is scored by a small embedded gradient-boosted tree model over
+// lexical, structural and positional features (LineFeatures); an operating
+// point turns the scores into a selection. Pure Go, deterministic, no network
+// and no files at runtime. It fails closed: an unknown operating point, an
+// unusable model, a blank query, a small or oversized input, a line that reads
+// as a marker or a cut too small to matter returns the context unchanged.
+package trim
+
+import (
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+)
+
+const (
+	// maxContextBytes: scoring costs time and memory in proportion to the input.
+	maxContextBytes = 8 << 20
+	// maxContextLines: every line costs a 67-float feature row, so short lines cost more than their bytes.
+	maxContextLines = 200_000
+	// maxQueryBytes: BM25 cost grows with query terms; the latest part of the ask is what the context answers.
+	maxQueryBytes = 8 << 10
+)
+
+// Policy turns line scores into a selection.
+type Policy struct {
+	// Floor keeps every line scoring at least this share of the context's
+	// best line. Relative, because calibrated probabilities shrink as a
+	// context grows: one absolute threshold cuts long contexts far too hard.
+	Floor float64
+	// TopK always keeps the K best-scoring lines, so the output is never only
+	// markers.
+	TopK int
+	// Context keeps this many lines on each side of a line kept by Floor or
+	// TopK.
+	Context int
+	// Headers keeps up to this many enclosing block headers (the nearest
+	// earlier lines with a smaller indent) of every such line and, when above
+	// zero, the line opening its section (a Markdown heading, "[start of
+	// path]", "==> path <==", "diff --git", "File: path", or any short line
+	// in square brackets, such as a dated "[Session 8: ...]").
+	Headers int
+	// Gap fills a run of at most this many removed lines between kept lines;
+	// a marker would cost about as much as the lines.
+	Gap int
+	// MinChars returns contexts shorter than this unchanged.
+	MinChars int
+	// MinCut returns the context unchanged when the selection would remove
+	// less than this share of its bytes.
+	MinCut float64
+}
+
+// Points are the named operating points, tuned on the benchmark dev splits.
+var Points = map[string]Policy{
+	"conservative": {Floor: 0.0035, TopK: 3, Context: 1, Headers: 1, Gap: 2, MinChars: 2000, MinCut: 0.1},
+	"balanced":     {Floor: 0.008, TopK: 3, Context: 1, Headers: 1, Gap: 2, MinChars: 2000, MinCut: 0.1},
+	"aggressive":   {Floor: 0.035, TopK: 3, Context: 1, Headers: 1, Gap: 2, MinChars: 2000, MinCut: 0.1},
+}
+
+// DefaultPoint is used when Options.Point is empty.
+const DefaultPoint = "balanced"
+
+// Options selects how much to keep.
+type Options struct {
+	// Point names an entry of Points; empty means DefaultPoint. An unknown
+	// name returns the context unchanged.
+	Point string
+	// Policy, when set, replaces the named point (for tuning and frontiers).
+	Policy *Policy
+}
+
+// Result is the outcome of one Compress call.
+type Result struct {
+	// Output is the compressed text, or the context itself when Unchanged.
+	Output string
+	// KeptLines and RemovedLines count the context's lines ("\n" separated;
+	// the empty piece after a final "\n" is not a line).
+	KeptLines, RemovedLines int
+	// Point is the operating point used ("custom" for Options.Policy).
+	Point  string
+	Policy Policy
+	// Unchanged is true when the context was returned as is; Reason says why.
+	Unchanged bool
+	Reason    string
+}
+
+// Compress keeps the lines of context that the query needs. A blank query is
+// no query: the context comes back unchanged.
+func Compress(context, query string, opts Options) Result {
+	name, policy := opts.Point, Policy{}
+	if opts.Policy != nil {
+		name, policy = "custom", *opts.Policy
+	} else {
+		if name == "" {
+			name = DefaultPoint
+		}
+		p, ok := Points[name]
+		if !ok {
+			return unchanged(context, name, policy, "unknown operating point")
+		}
+		policy = p
+	}
+	switch {
+	case strings.TrimSpace(query) == "":
+		return unchanged(context, name, policy, "no query")
+	case len(context) < policy.MinChars:
+		return unchanged(context, name, policy, "context below the minimum size")
+	case len(context) > maxContextBytes:
+		return unchanged(context, name, policy, "context over 8 MiB")
+	case lineCount(context) > maxContextLines:
+		return unchanged(context, name, policy, "context over 200,000 lines")
+	case strings.Contains(context, "…") && markerLine.MatchString(context):
+		return unchanged(context, name, policy, "context has a line that reads as an elision marker")
+	}
+	lines, scores, err := Score(context, query)
+	if err != nil {
+		return unchanged(context, name, policy, err.Error())
+	}
+	out, kept := policy.Apply(lines, scores)
+	if float64(len(out)) > float64(len(context))*(1-policy.MinCut) {
+		return unchanged(context, name, policy, "cut below the minimum")
+	}
+	return Result{Output: out, KeptLines: kept, RemovedLines: lineCount(context) - kept, Point: name, Policy: policy}
+}
+
+// Score splits context at "\n" and returns its lines with each line's keep
+// probability for the query; blank lines score 0.
+func Score(context, query string) ([]string, []float64, error) {
+	m, err := model()
+	if err != nil {
+		return nil, nil, err
+	}
+	lines, rows := LineFeatures(context, query)
+	scores := make([]float64, len(lines))
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			scores[i] = m.probability(rows[i])
+		}
+	}
+	return lines, scores, nil
+}
+
+// Apply selects lines by score and renders them: kept lines verbatim, one
+// marker line per removed run. It returns the output and the kept line count.
+// The empty piece after a final "\n" is not a line: the output ends with
+// "\n" as the context does.
+func (p Policy) Apply(lines []string, scores []float64) (string, int) {
+	final := len(lines) > 1 && lines[len(lines)-1] == ""
+	if final {
+		lines, scores = lines[:len(lines)-1], scores[:len(scores)-1]
+	}
+	blank := make([]bool, len(lines))
+	indent := make([]int, len(lines))
+	section := make([]int, len(lines))
+	open := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		blank[i] = trimmed == ""
+		indent[i] = indentOf(line)
+		section[i] = open
+		if hasAnyPrefix(trimmed, sectionPrefixes) || len(trimmed) < 120 && strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			open = i
+		}
+	}
+	out, kept := render(lines, selectLines(scores, blank, indent, section, p))
+	if final {
+		out += "\n"
+	}
+	return out, kept
+}
+
+func unchanged(context, name string, policy Policy, reason string) Result {
+	return Result{Output: context, KeptLines: lineCount(context), Point: name, Policy: policy, Unchanged: true, Reason: reason}
+}
+
+// lineCount counts the lines of context; the empty piece after a final "\n"
+// is not one.
+func lineCount(context string) int {
+	return strings.Count(strings.TrimSuffix(context, "\n"), "\n") + 1
+}
+
+// markerLine matches a line that reads as a marker: a context holding one
+// would make the output ambiguous.
+var markerLine = regexp.MustCompile(`(?m)^[ \t]*… \d+ lines? …[ \t\r]*$`)
+
+func selectLines(score []float64, blank []bool, indent, section []int, p Policy) []bool {
+	n := len(score)
+	order := make([]int, 0, n)
+	for i := range score {
+		if !blank[i] {
+			order = append(order, i)
+		}
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		switch {
+		case score[a] > score[b]:
+			return -1
+		case score[a] < score[b]:
+			return 1
+		}
+		return 0
+	})
+	seed := make([]bool, n)
+	for k, i := range order {
+		seed[i] = k < p.TopK || score[i] >= p.Floor*score[order[0]]
+	}
+
+	keep := slices.Clone(seed)
+	headers := blockHeaders(indent, blank)
+	for i := range seed {
+		if !seed[i] {
+			continue
+		}
+		for j := max(0, i-p.Context); j <= min(n-1, i+p.Context); j++ {
+			keep[j] = true
+		}
+		for h, k := headers[i], 0; h >= 0 && k < p.Headers; h, k = headers[h], k+1 {
+			keep[h] = true
+		}
+		if p.Headers > 0 && section[i] >= 0 {
+			keep[section[i]] = true
+		}
+	}
+	// Fill short gaps and gaps of blank lines between kept lines.
+	last := -1
+	for i := range keep {
+		if !keep[i] {
+			continue
+		}
+		if gap := blank[last+1 : i]; last >= 0 && len(gap) > 0 && (len(gap) <= p.Gap || allBlank(gap)) {
+			for j := last + 1; j < i; j++ {
+				keep[j] = true
+			}
+		}
+		last = i
+	}
+	return keep
+}
+
+var sectionPrefixes = []string{"# ", "## ", "### ", "#### ", "[start of ", "==> ", "diff --git ", "File: "}
+
+func allBlank(b []bool) bool {
+	for _, x := range b {
+		if !x {
+			return false
+		}
+	}
+	return true
+}
+
+// render writes the kept lines verbatim and one marker line per removed run.
+func render(lines []string, keep []bool) (string, int) {
+	var b strings.Builder
+	kept := 0
+	for i := 0; i < len(lines); {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		if keep[i] {
+			b.WriteString(lines[i])
+			kept++
+			i++
+			continue
+		}
+		j := i
+		for j < len(lines) && !keep[j] {
+			j++
+		}
+		b.WriteString(marker(j - i))
+		i = j
+	}
+	return b.String(), kept
+}
+
+func marker(n int) string {
+	if n == 1 {
+		return "… 1 line …"
+	}
+	return fmt.Sprintf("… %d lines …", n)
+}
+</file>
+
+</files>
+
