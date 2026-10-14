@@ -1,0 +1,11 @@
+… 269 lines …
+2026-10-11T03:04:28Z INFO checkout request 1268 served in 23ms
+2026-10-11T03:04:29Z INFO checkout request 1269 served in 24ms
+2026-10-11T03:04:30Z INFO checkout request 1270 served in 25ms
+2026-10-11T03:04:31Z INFO checkout request 1271 served in 26ms
+2026-10-11T03:04:31Z ERROR payment client: ledger-db timeout after 30s (order 1271)
+    at LedgerClient.charge (ledger/client.go:88)
+2026-10-11T03:04:32Z INFO checkout request 1272 served in 10ms
+2026-10-11T03:04:33Z INFO checkout request 1273 served in 11ms
+2026-10-11T03:04:34Z INFO checkout request 1274 served in 12ms
+… 126 lines …

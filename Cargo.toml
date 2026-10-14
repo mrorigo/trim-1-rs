@@ -2,5 +2,14 @@
 name = "trim-1-rs"
 version = "0.1.0"
 edition = "2024"
+autolib = false
+
+[lib]
+name = "trim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "trim"
+path = "src/main.rs"
 
 [dependencies]
