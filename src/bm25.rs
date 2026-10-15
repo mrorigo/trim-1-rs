@@ -32,16 +32,13 @@ pub(crate) fn score(query: &str, docs: &[&str]) -> Vec<f64> {
     } else {
         1.0
     };
-    let terms = query_terms
-        .keys()
-        .collect::<std::collections::BTreeSet<_>>();
     for i in 0..docs.len() {
-        for term in &terms {
-            let tf = *tfs[i].get(*term).unwrap_or(&0) as f64;
+        for term in query_terms.keys() {
+            let tf = *tfs[i].get(term).unwrap_or(&0) as f64;
             if tf == 0.0 {
                 continue;
             }
-            let document_frequency = df[*term] as f64;
+            let document_frequency = df[term] as f64;
             let idf = (1.0
                 + (docs.len() as f64 - document_frequency + 0.5) / (document_frequency + 0.5))
                 .ln();

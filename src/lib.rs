@@ -7,12 +7,20 @@ mod model;
 mod policy;
 
 pub use features::{FEATURE_NAMES, line_features};
-pub use model::Forest;
+pub use model::{Forest, TrimError};
 pub use policy::{DEFAULT_POINT, Options, POINTS, Policy, Result, compress, score};
 
 /// Describes the embedded model for diagnostics.
-pub fn model_info() -> std::result::Result<String, String> {
-    let model = model::embedded().map_err(|e| e.to_string())?;
+///
+/// # Returns
+///
+/// Returns the tree, node, feature, and serialized byte counts.
+///
+/// # Errors
+///
+/// Returns an error if the embedded model cannot be parsed.
+pub fn model_info() -> std::result::Result<String, TrimError> {
+    let model = model::embedded().map_err(Clone::clone)?;
     Ok(format!(
         "{} trees, {} nodes, {} features, {} bytes",
         model.roots_len(),

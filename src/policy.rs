@@ -2,7 +2,7 @@
 //! Compression policies, line selection, and the public scoring API.
 
 use crate::features::{block_headers, indent_of, line_features};
-use crate::model::{Forest, embedded};
+use crate::model::{Forest, TrimError, embedded};
 
 /// Default operating point used when no point is named.
 pub const DEFAULT_POINT: &str = "balanced";
@@ -12,6 +12,9 @@ pub const MAX_CONTEXT_BYTES: usize = 8 << 20;
 pub const MAX_CONTEXT_LINES: usize = 200_000;
 
 /// Converts line scores into a selection.
+///
+/// The thresholds control which lines are selected, how much neighboring
+/// context is retained, and when a result is considered useful enough to use.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Policy {
     /// Keep lines scoring at least this share of the best score.
@@ -71,6 +74,9 @@ pub const POINTS: [(&str, Policy); 3] = [
 ];
 
 /// Selects an operating point or a custom policy.
+///
+/// An empty `point` selects the balanced operating point. When `policy` is
+/// present, it takes precedence over `point`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options<'a> {
     /// Point name; an empty name selects `balanced`.
@@ -80,6 +86,9 @@ pub struct Options<'a> {
 }
 
 /// One compression outcome.
+///
+/// The output is either compressed text with elision markers or the original
+/// context with a reason that compression was skipped.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Result {
     /// Compressed text, or the original context when unchanged.
@@ -99,32 +108,59 @@ pub struct Result {
 }
 
 /// Scores every context line for the query.
-pub fn score(context: &str, query: &str) -> std::result::Result<(Vec<String>, Vec<f64>), String> {
-    let model = embedded().map_err(|e| e.to_string())?;
-    score_with_model(context, query, &model)
+///
+/// # Arguments
+///
+/// * `context` — text whose lines will be scored.
+/// * `query` — the request used to compute relevance features.
+///
+/// # Returns
+///
+/// Returns each input line and its keep probability in matching order.
+///
+/// # Errors
+///
+/// Returns an error if the embedded model cannot be loaded or scored.
+pub fn score(
+    context: &str,
+    query: &str,
+) -> std::result::Result<(Vec<String>, Vec<f64>), TrimError> {
+    let model = embedded().map_err(Clone::clone)?;
+    score_with_model(context, query, model)
 }
 
 fn score_with_model(
     context: &str,
     query: &str,
     model: &Forest,
-) -> std::result::Result<(Vec<String>, Vec<f64>), String> {
+) -> std::result::Result<(Vec<String>, Vec<f64>), TrimError> {
     let (lines, rows) = line_features(context, query);
     let scores = lines
         .iter()
         .zip(rows)
         .map(|(line, row)| {
             if line.trim().is_empty() {
-                0.0
+                Ok(0.0)
             } else {
                 model.probability(&row)
             }
         })
-        .collect();
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((lines, scores))
 }
 
 /// Compresses context to lines relevant to the query.
+///
+/// # Arguments
+///
+/// * `context` — text to compress.
+/// * `query` — the request used to select relevant lines.
+/// * `opts` — named operating point or custom policy.
+///
+/// # Returns
+///
+/// Returns the compressed text and selection metadata. Ineligible inputs are
+/// returned unchanged with a reason.
 pub fn compress(context: &str, query: &str, opts: Options<'_>) -> Result {
     let (name, policy) = if let Some(policy) = opts.policy {
         ("custom".to_owned(), policy)
@@ -175,11 +211,14 @@ pub fn compress(context: &str, query: &str, opts: Options<'_>) -> Result {
         Ok(model) => model,
         Err(err) => return unchanged(context, name, policy, &err.to_string()),
     };
-    let (lines, scores) = match score_with_model(context, query, &model) {
+    let (lines, scores) = match score_with_model(context, query, model) {
         Ok(scored) => scored,
-        Err(reason) => return unchanged(context, name, policy, &reason),
+        Err(reason) => return unchanged(context, name, policy, &reason.to_string()),
     };
-    let (output, kept_lines) = policy.apply(&lines, &scores);
+    let (output, kept_lines) = match policy.apply(&lines, &scores) {
+        Ok(result) => result,
+        Err(reason) => return unchanged(context, name, policy, &reason.to_string()),
+    };
     if output.len() as f64 > context.len() as f64 * (1.0 - policy.min_cut) {
         return unchanged(context, name, policy, "cut below the minimum");
     }
@@ -196,7 +235,26 @@ pub fn compress(context: &str, query: &str, opts: Options<'_>) -> Result {
 
 impl Policy {
     /// Applies this policy to lines and scores, returning rendered text and kept line count.
-    pub fn apply(&self, lines: &[String], scores: &[f64]) -> (String, usize) {
+    ///
+    /// The score slice must contain one value per line. A trailing empty line
+    /// produced by a final newline is preserved and excluded from selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the number of scores does not match the number of
+    /// lines.
+    pub fn apply(
+        &self,
+        lines: &[String],
+        scores: &[f64],
+    ) -> std::result::Result<(String, usize), TrimError> {
+        if lines.len() != scores.len() {
+            return Err(TrimError::invalid_input(format!(
+                "policy: expected {} scores, got {}",
+                lines.len(),
+                scores.len()
+            )));
+        }
         let final_newline = lines.len() > 1 && lines.last().is_some_and(String::is_empty);
         let n = lines.len() - usize::from(final_newline);
         let lines = &lines[..n];
@@ -222,7 +280,7 @@ impl Policy {
         if final_newline {
             output.push('\n');
         }
-        (output, kept)
+        Ok((output, kept))
     }
 }
 
@@ -249,10 +307,13 @@ fn count_lines(context: &str) -> usize {
 fn has_marker_line(context: &str) -> bool {
     context.lines().any(|line| {
         let line = line.trim_matches([' ', '\t', '\r']);
-        line.starts_with("… ") && line.ends_with(" lines …")
-            || line.starts_with("… ")
-                && line.ends_with(" line …")
-                && line[4..line.len() - 7].chars().all(|c| c.is_ascii_digit())
+        let Some(rest) = line.strip_prefix("… ") else {
+            return false;
+        };
+        [" lines …", " line …"].iter().any(|suffix| {
+            rest.strip_suffix(suffix)
+                .is_some_and(|count| !count.is_empty() && count.chars().all(|c| c.is_ascii_digit()))
+        })
     })
 }
 fn section_prefix(s: &str) -> bool {
@@ -322,7 +383,7 @@ fn select_lines(
         }
         if let Some(prev) = last {
             let gap = &keep[prev + 1..i];
-            if !gap.is_empty() && (gap.len() <= p.gap || gap.iter().all(|&v| !v)) {
+            if !gap.is_empty() && gap.len() <= p.gap {
                 for v in &mut keep[prev + 1..i] {
                     *v = true;
                 }

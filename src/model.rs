@@ -3,21 +3,32 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::OnceLock;
 
 use crate::features::{FEATURE_NAMES, N_FEATURES};
 
 const MODEL: &[u8] = include_bytes!("../model.bin");
 
+/// An error encountered while parsing a forest or validating scoring input.
+///
+/// The message describes invalid model data or input with an unexpected shape.
+/// Errors are recoverable and do not indicate a panic condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelError(String);
+pub struct TrimError(String);
 
-impl fmt::Display for ModelError {
+impl fmt::Display for TrimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl Error for ModelError {}
+impl Error for TrimError {}
+
+impl TrimError {
+    pub(crate) fn invalid_input(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Node {
@@ -28,6 +39,11 @@ struct Node {
 }
 
 /// A validated forest used to score feature rows.
+///
+/// Construct a forest with [`Forest::parse`], then pass rows with exactly the
+/// feature width declared by this crate to [`Forest::raw`] or
+/// [`Forest::probability`]. Malformed serialized models are rejected during
+/// parsing.
 #[derive(Debug, Clone)]
 pub struct Forest {
     roots: Vec<i32>,
@@ -38,22 +54,33 @@ pub struct Forest {
 impl Forest {
     /// Parses and validates a serialized `KEEP` model.
     ///
+    /// The parser checks the model header, feature names, body length, node
+    /// references, and feature indexes before creating a forest.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` — serialized model data.
+    ///
+    /// # Returns
+    ///
+    /// Returns a forest that can safely score rows of the expected width.
+    ///
     /// # Errors
     ///
     /// Returns an error if the header, feature names, bounds, or body is invalid.
-    pub fn parse(bytes: &[u8]) -> Result<Self, ModelError> {
+    pub fn parse(bytes: &[u8]) -> Result<Self, TrimError> {
         if bytes.len() < 24 {
-            return Err(ModelError("trim model header: truncated".into()));
+            return Err(TrimError("trim model header: truncated".into()));
         }
         if &bytes[..4] != b"KEEP" || read_u32(bytes, 4)? != 1 {
-            return Err(ModelError("trim model: bad magic or version".into()));
+            return Err(TrimError("trim model: bad magic or version".into()));
         }
         let features = read_u32(bytes, 8)? as usize;
         let trees = read_u32(bytes, 12)? as usize;
         let node_count = read_u32(bytes, 16)? as usize;
         let leaf_count = read_u32(bytes, 20)? as usize;
         if features != N_FEATURES || trees == 0 || node_count > 1 << 24 || leaf_count > 1 << 24 {
-            return Err(ModelError(format!(
+            return Err(TrimError(format!(
                 "trim model: {features} features, {trees} trees, {node_count} nodes, {leaf_count} leaves (package computes {N_FEATURES} features)"
             )));
         }
@@ -68,7 +95,7 @@ impl Forest {
                 .ok_or_else(overflow_error)?;
         }
         if expected != bytes.len() {
-            return Err(ModelError(format!(
+            return Err(TrimError(format!(
                 "trim model: header implies {expected} bytes, model has {}",
                 bytes.len()
             )));
@@ -81,9 +108,9 @@ impl Forest {
             let end = cursor.checked_add(len).ok_or_else(overflow_error)?;
             let name = bytes
                 .get(cursor..end)
-                .ok_or_else(|| ModelError("trim model feature names: truncated".into()))?;
+                .ok_or_else(|| TrimError("trim model feature names: truncated".into()))?;
             if name != expected_name.as_bytes() {
-                return Err(ModelError(format!(
+                return Err(TrimError(format!(
                     "trim model feature {i} does not match package feature name"
                 )));
             }
@@ -121,7 +148,7 @@ impl Forest {
             cursor += 8;
         }
         if cursor != bytes.len() {
-            return Err(ModelError(format!(
+            return Err(TrimError(format!(
                 "trim model: {} trailing bytes",
                 bytes.len() - cursor
             )));
@@ -135,7 +162,7 @@ impl Forest {
         };
         for &root in &roots {
             if !valid(root) {
-                return Err(ModelError("trim model: root out of range".into()));
+                return Err(TrimError("trim model: root out of range".into()));
             }
         }
         let mut nodes = Vec::with_capacity(node_count);
@@ -152,7 +179,7 @@ impl Forest {
                 || r >= 0 && r <= i as i32
                 || threshold.is_nan()
             {
-                return Err(ModelError(format!("trim model: node {i} out of range")));
+                return Err(TrimError(format!("trim model: node {i} out of range")));
             }
             let mut threshold32 = threshold as f32;
             if f64::from(threshold32) > threshold {
@@ -173,7 +200,21 @@ impl Forest {
     }
 
     /// Returns the ordered sum of tree leaf values for a feature row.
-    pub fn raw(&self, row: &[f32]) -> f64 {
+    ///
+    /// # Arguments
+    ///
+    /// * `row` — one value for each feature expected by the forest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `row` has the wrong number of features.
+    pub fn raw(&self, row: &[f32]) -> Result<f64, TrimError> {
+        if row.len() != N_FEATURES {
+            return Err(TrimError(format!(
+                "trim model: expected {N_FEATURES} features, got {}",
+                row.len()
+            )));
+        }
         let mut sum = 0.0;
         for &root in &self.roots {
             let mut index = root;
@@ -187,12 +228,20 @@ impl Forest {
             }
             sum += self.leaves[(!index) as usize];
         }
-        sum
+        Ok(sum)
     }
 
     /// Converts the raw forest score to the model's keep probability.
-    pub fn probability(&self, row: &[f32]) -> f64 {
-        1.0 / (1.0 + portable_exp(-self.raw(row)))
+    ///
+    /// # Arguments
+    ///
+    /// * `row` — one value for each feature expected by the forest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `row` has the wrong number of features.
+    pub fn probability(&self, row: &[f32]) -> Result<f64, TrimError> {
+        Ok(1.0 / (1.0 + portable_exp(-self.raw(row)?)))
     }
 
     pub(crate) fn roots_len(&self) -> usize {
@@ -203,39 +252,40 @@ impl Forest {
     }
 }
 
-pub(crate) fn embedded() -> Result<Forest, ModelError> {
-    Forest::parse(MODEL)
+pub(crate) fn embedded() -> Result<&'static Forest, &'static TrimError> {
+    static FOREST: OnceLock<Result<Forest, TrimError>> = OnceLock::new();
+    FOREST.get_or_init(|| Forest::parse(MODEL)).as_ref()
 }
 
-fn overflow_error() -> ModelError {
-    ModelError("trim model: size overflow".into())
+fn overflow_error() -> TrimError {
+    TrimError("trim model: size overflow".into())
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ModelError> {
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, TrimError> {
     let b = bytes
         .get(offset..offset + 2)
-        .ok_or_else(|| ModelError("trim model body: truncated".into()))?;
+        .ok_or_else(|| TrimError("trim model body: truncated".into()))?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ModelError> {
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, TrimError> {
     let b = bytes
         .get(offset..offset + 4)
-        .ok_or_else(|| ModelError("trim model body: truncated".into()))?;
+        .ok_or_else(|| TrimError("trim model body: truncated".into()))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, ModelError> {
+fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, TrimError> {
     Ok(read_u32(bytes, offset)? as i32)
 }
 
-fn read_f64(bytes: &[u8], offset: usize) -> Result<f64, ModelError> {
+fn read_f64(bytes: &[u8], offset: usize) -> Result<f64, TrimError> {
     Ok(f64::from_bits(u64::from_le_bytes(
         bytes
             .get(offset..offset + 8)
-            .ok_or_else(|| ModelError("trim model body: truncated".into()))?
+            .ok_or_else(|| TrimError("trim model body: truncated".into()))?
             .try_into()
-            .map_err(|_| ModelError("trim model body: truncated".into()))?,
+            .map_err(|_| TrimError("trim model body: truncated".into()))?,
     )))
 }
 

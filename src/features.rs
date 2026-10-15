@@ -138,6 +138,18 @@ const F_PRF_COVER: usize = 65;
 const F_PRF_COMPOUND: usize = 66;
 
 /// Splits context into lines and computes one model feature row per line.
+///
+/// Feature order matches [`FEATURE_NAMES`]. An empty context still produces
+/// one empty line because splitting is performed on the newline character.
+///
+/// # Arguments
+///
+/// * `context` — text to split and describe.
+/// * `query` — text used to compute relevance features.
+///
+/// # Returns
+///
+/// Returns the split lines and a matching feature row for each line.
 pub fn line_features(context: &str, query: &str) -> (Vec<String>, Vec<Vec<f32>>) {
     let query = cap_query(query);
     let lines = context.split('\n').map(str::to_owned).collect::<Vec<_>>();
@@ -627,15 +639,15 @@ fn template(s: &str) -> String {
     while i < b.len() {
         let c = b[i];
         if c.is_ascii_digit() {
-            while i < b.len() && (is_hex(b[i]) || b[i] == b'.' || b[i] == b':') {
+            while i < b.len() && (b[i].is_ascii_hexdigit() || b[i] == b'.' || b[i] == b':') {
                 i += 1;
             }
             out.push('0');
             continue;
         }
-        if is_hex(c) {
+        if c.is_ascii_hexdigit() {
             let mut j = i;
-            while j < b.len() && is_hex(b[j]) {
+            while j < b.len() && b[j].is_ascii_hexdigit() {
                 j += 1;
             }
             if j - i >= 8 {
@@ -648,9 +660,6 @@ fn template(s: &str) -> String {
         i += 1;
     }
     out
-}
-fn is_hex(c: u8) -> bool {
-    c.is_ascii_hexdigit()
 }
 pub(crate) fn indent_of(line: &str) -> usize {
     line.chars()

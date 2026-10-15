@@ -8,7 +8,12 @@ fn embedded_model_parses_and_feature_contract_matches() {
     let bytes = include_bytes!("../model.bin");
     let forest = Forest::parse(bytes).expect("embedded model should parse");
     assert_eq!(FEATURE_NAMES.len(), 67);
-    assert!(forest.raw(&vec![0.0; FEATURE_NAMES.len()]).is_finite());
+    assert!(
+        forest
+            .raw(&vec![0.0; FEATURE_NAMES.len()])
+            .unwrap()
+            .is_finite()
+    );
 }
 
 #[test]
@@ -33,7 +38,7 @@ fn model_raw_predictions_match_go_parity_fixture_bit_for_bit() {
         let expected =
             u64::from_le_bytes(bytes[score_offset..score_offset + 8].try_into().unwrap());
         assert_eq!(
-            forest.raw(&row).to_bits(),
+            forest.raw(&row).unwrap().to_bits(),
             expected,
             "fixture row {row_index}"
         );
@@ -76,9 +81,60 @@ fn final_newline_is_preserved_and_empty_split_piece_is_not_counted() {
         min_chars: 0,
         min_cut: 0.0,
     };
-    let (out, kept) = policy.apply(&lines, &[1.0, 0.0, 0.0, 0.0, 0.0]);
+    let (out, kept) = policy.apply(&lines, &[1.0, 0.0, 0.0, 0.0, 0.0]).unwrap();
     assert_eq!(out, "a\n… 3 lines …\n");
     assert_eq!(kept, 1);
+}
+
+#[test]
+fn policy_gap_and_input_lengths_are_respected() {
+    let lines = ["first", "drop one", "drop two", "last"].map(str::to_owned);
+    let policy = Policy {
+        floor: 1.0,
+        top_k: 1,
+        context: 0,
+        headers: 0,
+        gap: 0,
+        min_chars: 0,
+        min_cut: 0.0,
+    };
+    let (output, kept) = policy.apply(&lines, &[1.0, 0.0, 0.0, 1.0]).unwrap();
+    assert_eq!(output, "first\n… 2 lines …\nlast");
+    assert_eq!(kept, 2);
+    assert!(policy.apply(&lines, &[1.0]).is_err());
+}
+
+#[test]
+fn public_forest_scoring_rejects_rows_with_wrong_width() {
+    let forest = Forest::parse(include_bytes!("../model.bin")).unwrap();
+    assert!(forest.raw(&[]).is_err());
+    assert!(forest.probability(&[]).is_err());
+}
+
+#[test]
+fn singular_elision_marker_is_refused() {
+    let policy = Policy {
+        floor: 0.0,
+        top_k: 0,
+        context: 0,
+        headers: 0,
+        gap: 0,
+        min_chars: 0,
+        min_cut: 0.0,
+    };
+    let result = compress(
+        "first\n… 1 line …\nlast",
+        "first",
+        Options {
+            point: "",
+            policy: Some(policy),
+        },
+    );
+    assert!(result.unchanged);
+    assert_eq!(
+        result.reason,
+        "context has a line that reads as an elision marker"
+    );
 }
 
 #[test]
